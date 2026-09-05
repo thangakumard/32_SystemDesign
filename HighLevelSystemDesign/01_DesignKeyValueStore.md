@@ -103,8 +103,14 @@ Raw data (single copy):
 Total stored data (with RF=3):
   600 GB × 3 ≈ 1.8 TB across the cluster
 
-Write fan-out (every write touches N=3 replicas):
+Write fan-out (every write touches N=3 replicas, independent of W):
   50,000/sec × 3 ≈ 150,000 write-ops/sec cluster-wide
+  → W (1/QUORUM/N) only changes how many of those 3 ACKs the coordinator waits
+    for before replying to the client — it does NOT change how many replicas
+    physically receive the write. The coordinator always propagates to all N;
+    that's what "replication factor 3" means. So fan-out stays 150,000 ops/sec
+    whether W=1, W=QUORUM, or W=N — unlike reads, where R controls how many
+    replicas are even contacted in the first place.
 
 Read fan-out (depends on consistency level chosen):
   R=1 (fast, eventual):     200,000/sec
@@ -331,9 +337,14 @@ For specific data shapes — counters, sets, registers — use a data structure 
 ## 9. Component 5: Write Path
 
 ```
-1. Client hashes key → identifies preference list of N nodes (token-aware client,
-   or asks any node which forwards as coordinator)
-2. Client sends PUT to the coordinator node (any of the N, often the first alive one)
+1. Client sends PUT(key, value) to a node — a **token-aware client** hashed
+   the key locally against its cached ring (Section 5) and sends straight to a
+   preference-list node; a **"dumb" client** just sends to any node (e.g. via
+   a load balancer), not yet knowing the preference list at all
+2. If the receiving node isn't already on the preference list, it hashes the
+   key, walks the consistent-hash ring to derive the preference list of N nodes
+   (from the cluster's gossiped ring/membership state — not something the
+   client invents), and becomes the coordinator, acting on the client's behalf
 3. Coordinator generates/increments the vector clock for this write
 4. Coordinator sends the write to all N replicas in parallel (including itself if it's one)
 5. Each replica:
@@ -344,6 +355,29 @@ For specific data shapes — counters, sets, registers — use a data structure 
 7. On W acks received → return SUCCESS to client
 8. Remaining (N − W) replicas are updated asynchronously, best-effort
    (if a preference-list node is down, use hinted handoff — see Section 14)
+```
+
+**Flow diagram** (N=3, W=2 — coordinator returns as soon as 2 of 3 replicas ack, doesn't wait on the third):
+
+```
+ Client              Coordinator                Replica A     Replica B     Replica C
+   │                      │                          │             │             │
+   │── PUT(key,val) ─────▶│                          │             │             │
+   │                      │ hash(key), walk ring →   │             │             │
+   │                      │ preference list (if not  │             │             │
+   │                      │ already on it)           │             │             │
+   │                      │ generate/increment       │             │             │
+   │                      │ vector clock             │             │             │
+   │                      │                          │             │             │
+   │                      │── WRITE(k,v,vc) ────────▶│             │             │
+   │                      │── WRITE(k,v,vc) ──────────────────────▶│             │
+   │                      │── WRITE(k,v,vc) ────────────────────────────────────▶│
+   │                      │                          │WAL→memtable │WAL→memtable │WAL→memtable
+   │                      │◀──────── ACK ────────────│             │             │
+   │                      │◀──────── ACK ──────────────────────────│             │
+   │                      │  W=2 acks reached → return now, don't wait on C      │
+   │◀──── SUCCESS ────────│                          │             │             │
+   │                      │◀────── ACK (async, best-effort, no client wait) ─────│
 ```
 
 **Why WAL before memtable ack?** If the node crashes between step 5a and a memtable flush, replaying the WAL on restart recovers the write. Acking before the WAL write would risk silent data loss on crash — this is the same durability pattern as a database redo log or Kafka's own commit log (*see the [Kafka guide](#) for the general write-ahead-log-as-durability-primitive pattern*).
@@ -364,6 +398,28 @@ For specific data shapes — counters, sets, registers — use a data structure 
        the latest version to that replica asynchronously
      • This is the cheapest, most frequent form of anti-entropy — it only
        fixes divergence on keys that are actively being read
+```
+
+**Flow diagram** (N=3, R=2 — coordinator only needs 2 of 3 responses to answer the client):
+
+```
+ Client              Coordinator                Replica A     Replica B     Replica C
+   │                      │                          │             │             │
+   │── GET(key) ─────────▶│                          │             │             │
+   │                      │ hash(key), walk ring →   │             │             │
+   │                      │ preference list          │             │             │
+   │                      │                          │             │             │
+   │                      │── GET(key) ─────────────▶│             │             │
+   │                      │── GET(key) ───────────────────────────▶│             │
+│                         │    (contact R of N, or all N and take fastest R)     │
+   │                      │◀──── value + vclock ─────│             │             │
+   │                      │◀──── value + vclock ───────────────────│             │
+   │                      │  R=2 responses in → compare vector clocks            │
+   │                      │  • one dominates → return it                         │
+   │                      │  • concurrent → return siblings (Section 8)          │
+   │◀──── value(s) ───────│                          │             │             │
+   │                      │──READ REPAIR (async):push latest to stale replica───▶│
+   │                      │   (only runs if one of the R responses was stale)    │
 ```
 
 Read repair keeps *hot* keys converged for free as a side effect of normal traffic. It does **not** fix divergence on cold keys nobody reads — that's what background [Merkle-tree anti-entropy](#12-component-8-anti-entropy-merkle-trees) is for.
