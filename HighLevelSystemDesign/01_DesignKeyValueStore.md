@@ -15,17 +15,18 @@
 8. [Component 4: Conflict Resolution](#8-component-4-conflict-resolution)
 9. [Component 5: Write Path](#9-component-5-write-path)
 10. [Component 6: Read Path & Read Repair](#10-component-6-read-path--read-repair)
-11. [Component 7: Storage Engine (LSM-Tree)](#11-component-7-storage-engine-lsm-tree)
-12. [Component 8: Anti-Entropy (Merkle Trees)](#12-component-8-anti-entropy-merkle-trees)
-13. [Component 9: Failure Detection & Membership (Gossip)](#13-component-9-failure-detection--membership-gossip)
-14. [Component 10: Hinted Handoff & Sloppy Quorum](#14-component-10-hinted-handoff--sloppy-quorum)
-15. [CAP / PACELC Positioning](#15-cap--pacelc-positioning)
-16. [Failure Modes & Mitigations](#16-failure-modes--mitigations)
-17. [Scalability & Rebalancing](#17-scalability--rebalancing)
-18. [Tunable Consistency & Client Considerations](#18-tunable-consistency--client-considerations)
-19. [Senior vs Staff Answer Differentiators](#19-senior-vs-staff-answer-differentiators)
-20. [Interview Time Allocation](#20-interview-time-allocation)
-21. [Quick-Reference Cheatsheet](#21-quick-reference-cheatsheet)
+11. [Component 7: Delete Path (Tombstones)](#11-component-7-delete-path-tombstones)
+12. [Component 8: Storage Engine (LSM-Tree)](#12-component-8-storage-engine-lsm-tree)
+13. [Component 9: Anti-Entropy (Merkle Trees)](#13-component-9-anti-entropy-merkle-trees)
+14. [Component 10: Failure Detection & Membership (Gossip)](#14-component-10-failure-detection--membership-gossip)
+15. [Component 11: Hinted Handoff & Sloppy Quorum](#15-component-11-hinted-handoff--sloppy-quorum)
+16. [CAP / PACELC Positioning](#16-cap--pacelc-positioning)
+17. [Failure Modes & Mitigations](#17-failure-modes--mitigations)
+18. [Scalability & Rebalancing](#18-scalability--rebalancing)
+19. [Tunable Consistency & Client Considerations](#19-tunable-consistency--client-considerations)
+20. [Senior vs Staff Answer Differentiators](#20-senior-vs-staff-answer-differentiators)
+21. [Interview Time Allocation](#21-interview-time-allocation)
+22. [Quick-Reference Cheatsheet](#22-quick-reference-cheatsheet)
 
 ---
 
@@ -239,6 +240,40 @@ Each key is replicated to **N** nodes (typically N=3) drawn from its preference 
 
 Preference lists can be extended to span datacenters: replicate synchronously within the local DC (for latency) and asynchronously cross-DC (for disaster recovery). `LOCAL_QUORUM` (quorum within the local DC only) is the practical default for multi-region deployments — waiting on a cross-ocean quorum for every write is a latency non-starter.
 
+**Coordinator selection across DCs:** there is no single global coordinator. Each DC runs its **own** token ring and derives its **own** local preference list for key `K` (Cassandra's `NetworkTopologyStrategy` is the reference implementation — replication factor is specified *per DC*, e.g. `{DC-East: 3, DC-West: 3}`). The client's request lands in whichever DC it's routed to (nearest-region via GeoDNS, or client-side region affinity); the node in *that* DC's preference list that receives it becomes the **local coordinator**, exactly as in Section 9. That local coordinator then relays the write, asynchronously and off the client's critical path, to one node in each remote DC's preference list — that remote node becomes the **remote coordinator** and fans the write out to its own local replicas.
+
+```
+Client (routed to nearest DC via GeoDNS / client-side region affinity, e.g. "us-east")
+   │
+   ▼
+┌─────────────────────── DC-East (local, N=3 replicas) ───────────────────────┐
+│ hash(K) walked against DC-East's own ring → local preference list [E1,E2,E3] │
+│                                                                              │
+│ Client ──PUT(k,v)──▶ E2  (E2 owns K here → becomes LOCAL COORDINATOR)       │
+│                        ├──WRITE──▶ E1  WAL→memtable ──ACK──┐               │
+│                        ├──WRITE──▶ E3  WAL→memtable ──ACK──┤               │
+│                        └──(E2 applies locally too)─────────┤               │
+│                        waits for LOCAL_QUORUM (e.g. W=2 of 3, all in-DC)    │
+│                        ◀── SUCCESS returned to client ──────────────────    │
+│                            (client never waits on DC-West)                  │
+└───────────────────────────────────┬────────────────────────────────────────┘
+                                     │ async, best-effort — not on the client's
+                                     │ write path (disaster-recovery copy)
+                                     ▼
+┌─────────────────────── DC-West (remote, its own N=3 replicas) ──────────────┐
+│ E2 forwards the write to a node in DC-West's own preference list for K      │
+│ → W1 becomes the REMOTE COORDINATOR for this write                         │
+│                                                                              │
+│ W1 ──WRITE──▶ W2  WAL→memtable ──ACK──┐                                    │
+│ W1 ──WRITE──▶ W3  WAL→memtable ──ACK──┤                                    │
+│ (W1 applies locally too)              │                                    │
+│ W1 does not need to ack DC-East back — this replication stream has no      │
+│ client waiting on it                                                       │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+If DC-East goes dark entirely, DC-West still has a full, independently-quorum-capable replica set — that's the disaster-recovery property this buys, at the cost of cross-DC copies lagging behind by however long the async stream takes to catch up (an eventual-consistency window between regions, on top of the intra-DC one from Section 8).
+
 ---
 
 ## 7. Component 3: Quorum Consistency (W / R / N)
@@ -282,7 +317,7 @@ Availability math (N=3):
 
 ## 8. Component 4: Conflict Resolution
 
-Because writes can succeed on different subsets of replicas (especially under [sloppy quorum](#14-component-10-hinted-handoff--sloppy-quorum)), the *same key* can end up with genuinely concurrent, conflicting versions. A leaderless store must resolve this — there's no single leader to serialize writes for you.
+Because writes can succeed on different subsets of replicas (especially under [sloppy quorum](#15-component-11-hinted-handoff--sloppy-quorum)), the *same key* can end up with genuinely concurrent, conflicting versions. A leaderless store must resolve this — there's no single leader to serialize writes for you.
 
 ### Option 1: Last-Write-Wins (LWW)
 
@@ -354,7 +389,7 @@ For specific data shapes — counters, sets, registers — use a data structure 
 6. Coordinator waits for W acknowledgments (not all N)
 7. On W acks received → return SUCCESS to client
 8. Remaining (N − W) replicas are updated asynchronously, best-effort
-   (if a preference-list node is down, use hinted handoff — see Section 14)
+   (if a preference-list node is down, use hinted handoff — see Section 15)
 ```
 
 **Flow diagram** (N=3, W=2 — coordinator returns as soon as 2 of 3 replicas ack, doesn't wait on the third):
@@ -422,11 +457,74 @@ For specific data shapes — counters, sets, registers — use a data structure 
    │                      │   (only runs if one of the R responses was stale)    │
 ```
 
-Read repair keeps *hot* keys converged for free as a side effect of normal traffic. It does **not** fix divergence on cold keys nobody reads — that's what background [Merkle-tree anti-entropy](#12-component-8-anti-entropy-merkle-trees) is for.
+Read repair keeps *hot* keys converged for free as a side effect of normal traffic. It does **not** fix divergence on cold keys nobody reads — that's what background [Merkle-tree anti-entropy](#13-component-9-anti-entropy-merkle-trees) is for.
 
 ---
 
-## 11. Component 7: Storage Engine (LSM-Tree)
+## 11. Component 7: Delete Path (Tombstones)
+
+`delete(key)` cannot mean "remove the bytes right now" in a leaderless, replicated store: the coordinator can't atomically wipe the key off N replicas (or M∙N across regions) in one step, and if it just deleted locally and let the other replicas eventually notice nothing was there, read repair and hinted handoff would helpfully **resurrect** the old value on the deleted replica the next time they see it elsewhere. So a delete is written as data, not as an absence:
+
+```
+1. Client sends DELETE(key) to a node → same routing as a write (Section 9):
+   token-aware client goes straight to a preference-list node, or a "dumb"
+   client's request gets forwarded to become one
+2. Coordinator generates a vector clock that causally DOMINATES the version
+   being deleted (increments the coordinator's own counter, same as a normal
+   write — see Section 8)
+3. Coordinator writes a TOMBSTONE record — {key, vclock, deleted: true} — down
+   the identical write path as a PUT:
+     a. Appends to WAL (durability before ack)
+     b. Applies to memtable (a tombstone occupies a normal memtable/SSTable
+        slot — it is data, until compaction reclaims it)
+     c. Sends ACK to coordinator
+4. Coordinator waits for W acks (LOCAL_QUORUM if multi-DC), returns SUCCESS
+5. Remaining replicas — including remote-DC replicas — receive the tombstone
+   asynchronously, via the same best-effort replication / hinted handoff /
+   read-repair / anti-entropy paths a normal write would use
+6. Reads: a tombstone wins vector-clock comparison exactly like any other
+   version (Section 8's rules, unmodified) — it just renders as "not found"
+   to the client instead of a value
+7. COMPACTION eventually discards the tombstone after a grace period once it
+   has had time to propagate everywhere (Section 12) — only then is the key
+   actually gone from disk
+```
+
+**Worked example — delete during a cross-region propagation gap** (using the DC-East / DC-West layout from Section 6):
+
+```
+t0:  Client PUT(K, "v1") via DC-East coordinator E2
+     → E1, E2, E3 all hold K="v1", vclock {E2:1}
+     → async cross-DC stream eventually lands v1 on W1, W2, W3 too
+
+t1:  Client DELETE(K) via DC-East coordinator E2
+     → E2 writes tombstone, vclock {E2:2} (dominates {E2:1})
+     → E1, E3 ack (LOCAL_QUORUM W=2 of 3) → SUCCESS returned to client
+     → E2 kicks off async tombstone replication toward DC-West — in flight,
+       not yet arrived
+     → DC-East now: E1, E2, E3 = tombstone {E2:2}
+
+t2:  (before the async stream from t1 reaches DC-West)
+     Different client sends GET(K) to DC-West coordinator W1
+     → W1, W2, W3 still hold K="v1", vclock {E2:1} — none has seen the
+       tombstone yet
+     → DC-West returns "v1" to this client — a value that is, at this
+       instant, already deleted in DC-East
+
+t3:  Async replication (or Merkle-tree anti-entropy, Section 13) delivers the
+     tombstone to W1, W2, W3
+     → vclock comparison: tombstone {E2:2} dominates value {E2:1} → tombstone
+       wins on every replica, exactly like resolving any other conflict
+     → subsequent GET(K) in DC-West now correctly returns "not found"
+```
+
+The `t2` result is not a bug — it's the eventual-consistency window this architecture explicitly trades for availability/latency (Section 16's CAP positioning). A client that needs read-your-writes across regions for deletes has to route back to the DC it wrote to, or accept the propagation lag, same as it would for any other write.
+
+**Staff-level nuance — delete resurrection:** the tombstone's on-disk grace period (compaction only purges it after some TTL, e.g. Cassandra's `gc_grace_seconds`) must be **longer than the slowest expected replication/anti-entropy lag** across all replicas, including remote DCs. If a tombstone is compacted away on one replica before a lagging replica or DC has received it, an anti-entropy sync or read repair sourcing from that lagging replica can push the old value back — the delete silently reverses. This is why Merkle-tree sync (Section 13) and hinted-handoff (Section 15) windows are a direct input into sizing the tombstone grace period, not an independent tuning knob.
+
+---
+
+## 12. Component 8: Storage Engine (LSM-Tree)
 
 Each node needs a local storage engine optimized for the write-heavy, append-friendly pattern this architecture produces. The **Log-Structured Merge Tree (LSM-tree)** is the standard choice (used by Cassandra, RocksDB, LevelDB, HBase).
 
@@ -440,7 +538,16 @@ Write path (per node):
   Memtable fills (e.g. 128–256 MB) ──▶ flush to disk as an immutable SSTable
                                         (Sorted String Table: sorted key→value
                                          pairs, written once, never mutated)
+```
 
+**Durability note:** the memtable is volatile (RAM only) — it has no
+crash-survival value on its own. The WAL is the sole durability boundary:
+it's an append-only disk write (often fsync'd), so it's slower than the
+in-memory memtable write, but it's what makes the memtable's loss on
+crash a non-issue — replay reconstructs it. This is why WAL append is
+sequenced before the memtable apply in the write path (Section 9).
+
+```
   Over time:
   Disk: [SSTable L0] [SSTable L0] [SSTable L0] [SSTable L1 (bigger, merged)] ...
          ▲ multiple small, unsorted-relative-to-each-other SSTables accumulate
@@ -486,7 +593,7 @@ get(key):
 
 ---
 
-## 12. Component 8: Anti-Entropy (Merkle Trees)
+## 13. Component 9: Anti-Entropy (Merkle Trees)
 
 Read repair only fixes divergence on keys someone actually reads. Cold data can silently diverge between replicas after a missed write (e.g., during a partition) and stay diverged forever without a background process to catch it.
 
@@ -517,7 +624,7 @@ This runs as a low-priority background process (often scheduled during off-peak 
 
 ---
 
-## 13. Component 9: Failure Detection & Membership (Gossip)
+## 14. Component 10: Failure Detection & Membership (Gossip)
 
 With no leader and no central coordinator, nodes need a decentralized way to learn the cluster's membership and detect failures.
 
@@ -551,7 +658,7 @@ This adapts per-node/per-link automatically — a node with historically jittery
 
 ---
 
-## 14. Component 10: Hinted Handoff & Sloppy Quorum
+## 15. Component 11: Hinted Handoff & Sloppy Quorum
 
 ### The Problem
 
@@ -583,7 +690,7 @@ Sloppy quorum trades **strict quorum overlap** for **write availability**. Durin
 
 ---
 
-## 15. CAP / PACELC Positioning
+## 16. CAP / PACELC Positioning
 
 *(Cross-reference: [CAP / PACELC Theorem guide](#) for the general framework — this section applies it per-component, as required at Staff level.)*
 
@@ -602,7 +709,7 @@ Sloppy quorum trades **strict quorum overlap** for **write availability**. Durin
 
 ---
 
-## 16. Failure Modes & Mitigations
+## 17. Failure Modes & Mitigations
 
 | Failure | Symptom | Detection | Mitigation |
 |---|---|---|---|
@@ -621,7 +728,7 @@ Sloppy quorum trades **strict quorum overlap** for **write availability**. Durin
 
 ---
 
-## 17. Scalability & Rebalancing
+## 18. Scalability & Rebalancing
 
 ### Adding a Node
 
@@ -662,7 +769,7 @@ Unplanned failure: remaining N-1 replicas + hinted handoff cover writes;
 
 ---
 
-## 18. Tunable Consistency & Client Considerations
+## 19. Tunable Consistency & Client Considerations
 
 ### Per-Request Consistency Levels
 
@@ -688,7 +795,7 @@ Without care, a client could read a newer version, then on a subsequent read hit
 
 ---
 
-## 19. Senior vs Staff Answer Differentiators
+## 20. Senior vs Staff Answer Differentiators
 
 ### Senior-level expectations
 
@@ -718,7 +825,7 @@ Without care, a client could read a newer version, then on a subsequent read hit
 
 ---
 
-## 20. Interview Time Allocation
+## 21. Interview Time Allocation
 
 For a 45-minute system design session:
 
@@ -738,7 +845,7 @@ For a 45-minute system design session:
 
 ---
 
-## 21. Quick-Reference Cheatsheet
+## 22. Quick-Reference Cheatsheet
 
 ```
 KEY ALGORITHMS
