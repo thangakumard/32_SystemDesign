@@ -91,20 +91,23 @@ Client ──HTTPS──▶ Azure Front Door + WAF ──▶ Azure API Managemen
                                                 │  • validate JWT sig / exp / aud
                                                 │  • coarse RBAC: role→API scope check
                                                 │  • rate limit, mTLS to backend
+                                                |  PEP - (Policy Enforcement Point)
                                                 ▼
-                              ┌───────────────────────────────────┐
-                              │   Catalog / Price / Inventory      │
-                              │   services (AKS) — PEP-2, fine     │
-                              └───────┬───────────────┬────────────┘
-                          decision    │               │ attribute lookup
-                                      ▼               ▼
-                         ┌────────────────────┐  ┌────────────────────────┐
-                         │  PDP: OPA sidecar    │◀─│ PIP: subject attrs      │
-                         │  (Rego/Cedar policy) │  │ (Entra Custom Security  │
-                         │  local, sub-ms decide│  │ Attrs, short-TTL cache) │
-                         └─────────┬────────────┘  │ resource attrs (from    │
-                                   │                │ the record itself)     │
-                              signed bundle          └────────────────────────┘
+                              ┌─────────────────────────────────────┐
+                              │   Catalog / Price / Inventory       │
+                              │   services (AKS) 
+                              | — PEP-2 (Policy Enforcement Point - 2)
+                              | , fine                              │
+                              └───────┬─────────────────────┬───────┘
+                          decision    │                     │ attribute lookup
+                                      ▼                     ▼
+                         ┌────────────────────┐        ┌────────────────────────┐
+                         │  PDP: OPA sidecar    │◀─    │ PIP (Policy Information Point): subject attrs      │
+                         │  (Rego/Cedar policy) │      │ (Entra Custom Security  │
+                         │  local, sub-ms decide│      │ Attrs, short-TTL cache) │
+                         └─────────┬────────────┘      │ resource attrs (from    │
+                                   │                   │ the record itself)      │
+                              signed bundle            └────────────────────────-┘
                                    │
                          ┌─────────▼────────────┐
                          │  PAP: Git repo policy  │
