@@ -8,21 +8,28 @@
 1. [Problem Statement & Scope](#1-problem-statement--scope)
 2. [Requirements](#2-requirements)
 3. [Capacity Estimation](#3-capacity-estimation)
-4. [High-Level Architecture](#4-high-level-architecture)
-5. [Component 1: Unique ID Generation](#5-component-1-unique-id-generation)
-6. [Component 2: Write Path (Shorten)](#6-component-2-write-path-shorten)
-7. [Component 3: Custom URL Aliases](#7-component-3-custom-url-aliases)
-8. [Component 4: Read Path (Redirect)](#8-component-4-read-path-redirect)
-9. [Component 5: Caching Layer](#9-component-5-caching-layer)
-10. [Component 6: Analytics & Tracking](#10-component-6-analytics--tracking)
-11. [Component 7: Storage Layer](#11-component-7-storage-layer)
-12. [CAP Theorem Positioning](#12-cap-theorem-positioning)
-13. [Failure Modes & Mitigations](#13-failure-modes--mitigations)
-14. [Concurrency & Collision Handling](#14-concurrency--collision-handling)
-15. [Global Distribution & Geo-Routing](#15-global-distribution--geo-routing)
-16. [Senior vs Staff Answer Differentiators](#16-senior-vs-staff-answer-differentiators)
-17. [Interview Time Allocation](#17-interview-time-allocation)
-18. [Quick-Reference Cheatsheet](#18-quick-reference-cheatsheet)
+4. [Core Entities](#4-core-entities)
+5. [APIs](#5-apis)
+6. [High-Level Architecture](#6-high-level-architecture)
+7. [Component 1: Unique ID Generation](#7-component-1-unique-id-generation)
+   - [Approach 1: Distributed Snowflake-Style ID (Senior-level)](#approach-1-distributed-snowflake-style-id-senior-level)
+   - [Approach 2: Hash-Based Generation (more common in practice)](#approach-2-hash-based-generation-more-common-in-practice)
+   - [Approach 3: Counter-Based with Base Conversion (Staff-level insight)](#approach-3-counter-based-with-base-conversion-staff-level-insight)
+   - [Recommended Approach: Hybrid Counter + Shuffle](#recommended-approach-hybrid-counter--shuffle)
+8. [Component 2: Write Path (Shorten)](#8-component-2-write-path-shorten)
+9. [Component 3: Custom URL Aliases](#9-component-3-custom-url-aliases)
+10. [Component 4: Read Path (Redirect)](#10-component-4-read-path-redirect)
+11. [Component 5: Caching Layer](#11-component-5-caching-layer)
+12. [Component 6: Analytics & Tracking](#12-component-6-analytics--tracking)
+13. [Component 7: Storage Layer](#13-component-7-storage-layer)
+14. [CAP Theorem Positioning](#14-cap-theorem-positioning)
+15. [Failure Modes & Mitigations](#15-failure-modes--mitigations)
+16. [Concurrency & Collision Handling](#16-concurrency--collision-handling)
+17. [Global Distribution & Geo-Routing](#17-global-distribution--geo-routing)
+18. [Senior vs Staff Answer Differentiators](#18-senior-vs-staff-answer-differentiators)
+19. [Interview Time Allocation](#19-interview-time-allocation)
+20. [Quick-Reference Cheatsheet](#20-quick-reference-cheatsheet)
+21. [Scaling Reads to 10K Redirects/Second](#21-scaling-reads-to-10k-redirectssecond)
 
 ---
 
@@ -117,66 +124,156 @@ Cache hit rate optimization:
 
 ---
 
-## 4. High-Level Architecture
+## 4. Core Entities
+
+The nouns the system stores and passes around. API contracts (next section) and the storage schema ([Storage Layer](#13-component-7-storage-layer)) are built from these.
+
+| Entity | Key Fields | Notes |
+|---|---|---|
+| **URL** | `short_code` (PK), `long_url`, `user_id`, `created_at`, `updated_at`, `expires_at`, `active`, `version` | The mapping record. `short_code` is the primary key; `version` enables CAS on edits. |
+| **CustomAlias** | `custom_code` (PK), `short_code`, `user_id`, `reserved`, `deleted_at` | Vanity codes; separate namespace so reserved words and reuse-after-delete can be managed. |
+| **User** | `user_id` (PK), `api_key`, `plan`, `rate_limit` | Owner of URLs; anonymous creation is optional. |
+| **URLAuditLog** | `id` (PK), `short_code`, `user_id`, `action`, `old_value`, `new_value`, `timestamp` | Append-only history of create/update/delete/disable; written on every change to a URL. Edits update `urls` in place, so this is where past versions live. |
+| **ClickEvent** | `short_code`, `timestamp`, `ip`, `country`, `referrer`, `user_agent`, `device_type` | Append-only analytics fact; written via Kafka, not on the redirect path. |
 
 ```
-                    ┌──────────────────────┐
-                    │  User / Client       │
-                    │  (Web, Mobile, API)  │
-                    └──────────┬───────────┘
-                               │
-              ┌────────────────┼────────────────┐
-              │                │                │
-    ┌─────────▼────────┐  ┌────▼──────────┐  ┌─▼─────────────┐
-    │ Write API        │  │ Read API      │  │ Analytics API │
-    │ /shorten         │  │ /redirect/{id}│  │ /stats/{id}   │
-    │ (100K/day)       │  │ (100M/day)    │  │ (tracking)    │
-    └────────┬─────────┘  └────┬──────────┘  └────┬──────────┘
-             │                 │                   │
-        ┌────▼─────────────────▼─────────────────┬─┘
-        │  API Gateway / Load Balancer           │
-        │  Rate limiting, request dedup          │
-        └────┬──────────────────────────────────┘
-             │
-        ┌────┴────────────────────────────────────────┐
-        │                                             │
-  ┌─────▼──────────────────┐          ┌──────────────▼────────┐
-  │ Unique ID Generator    │          │ Cache Layer (Redis)   │
-  │ Snowflake / ZK-backed  │          │ Hot URLs + analytics  │
-  │ (collision avoidance)  │          │ ~250MB, TTL 24h       │
-  └─────┬──────────────────┘          └──────────────┬────────┘
-        │                                            │
-        │  short_code                                │ miss
-        │  (6-7 chars)                               │
-        │                                            │
-  ┌─────▼──────────────────────────────────────────▼──────────┐
-  │ Primary Data Store                                         │
-  │ (MySQL / PostgreSQL with strong consistency)               │
-  │  Tables: urls, custom_aliases, url_metadata               │
-  │  Partitioned by short_code hash for locality               │
-  └─────┬───────────────────────────────────────────────────┬─┘
-        │                                                   │
-        │ Read replicas                                    │ Analytics
-        │ (geographic proximity)                           │ stream
-        │                                                   │
-  ┌─────▼──────────────┐  ┌─────────────────────────────┐  │
-  │ Regional Read      │  │ Message Queue (Kafka)       │──┘
-  │ Replicas           │  │ Click events                │
-  │ (APAC, EU, AMER)   │  │ (geo, referrer, device)     │
-  └────────────────────┘  └────────────┬────────────────┘
-                                       │
-                            ┌──────────▼─────────────┐
-                            │ Analytics Pipeline     │
-                            │ (Spark/Flink)          │
-                            │ → ClickHouse / BigQuery│
-                            └────────────────────────┘
+User 1 ──── * URL 1 ──── 0..1 CustomAlias
+                │
+                ├──── * URLAuditLog  (one row per create/edit/delete/disable)
+                │
+                └──── * ClickEvent   (analytics store, not the primary DB)
 ```
+
+---
+
+## 5. APIs
+
+REST over HTTPS. Writes and management require authentication (API key / OAuth token); redirects are public.
+
+### Endpoints
+
+| Operation | Method & Path | Auth | Purpose |
+|---|---|---|---|
+| Shorten | `POST /shorten` | Yes | Create a short URL (optionally with a custom code, expiry) |
+| Redirect | `GET /{short_code}` | No | Resolve short code and redirect to the original URL |
+| Edit | `PUT /urls/{short_code}` | Yes (owner) | Change target URL or expiry; requires `version` for CAS |
+| Disable / delete | `DELETE /urls/{short_code}` | Yes (owner) | Soft delete: sets `active=false`, keeps the record |
+| Analytics | `GET /stats/{short_code}?from=&to=&group_by=` | Yes (owner) | Click counts, geo, referrer, device breakdown |
+
+### Contracts
+
+```
+POST /shorten
+Idempotency-Key: abc123              // optional
+{
+  "long_url": "https://example.com/very/long/path?a=1&b=2",
+  "custom_code": "obama",            // optional
+  "expires_at": "2027-01-01T00:00:00Z",  // optional
+  "redirect_type": 301               // optional: 301 | 302
+}
+→ 201 Created
+{ "short_code": "obama", "short_url": "https://sho.rt/obama", "expires_at": "..." }
+
+GET /{short_code}
+→ 301/302  Location: {long_url}
+→ 404 Not Found   (unknown code)
+→ 410 Gone        (expired or disabled)
+
+PUT /urls/{short_code}
+{ "long_url": "https://newurl.com", "version": 10 }
+→ 200 OK  { "version": 11 }
+→ 409 Conflict    (stale version)
+
+DELETE /urls/{short_code}
+→ 204 No Content
+
+GET /stats/{short_code}?from=2026-01-01&to=2026-01-07&group_by=day
+→ 200 OK  { "total_clicks": 12345, "series": [...], "by_country": {...} }
+```
+
+### Status codes
+
+| Code | Meaning |
+|---|---|
+| 201 | Short URL created |
+| 301 | Permanent redirect: browsers cache it, so repeat visits skip the server (less load, but edits/expiry may not take effect for clients that cached it). Use only if the destination is truly permanent |
+| 302 | Temporary redirect: not cached by default, so every click reaches the redirect layer (edits/expiry apply immediately). Use when the destination can change or expire; the usual choice for editable/expiring short links |
+
+Choose 301 vs 302 based on whether the destination is truly permanent. Choose the analytics design separately: collect click events from the layer that actually serves the redirect (CDN access logs/edge events, or the redirect service's Kafka event).
+| 400 | Invalid URL or custom code format |
+| 403 | Reserved code, or not the owner |
+| 404 | Short code not found |
+| 409 | Custom code taken, or stale `version` on edit |
+| 410 | Expired or disabled |
+| 429 | Rate limit exceeded |
+
+**Design notes:**
+- The redirect endpoint sits at the root path (`/{short_code}`) to keep short URLs short; management APIs live under `/urls` and `/stats` to avoid colliding with codes.
+- Pagination (cursor-based) applies to listing a user's URLs: `GET /urls?cursor=`.
+- Rate limit `POST /shorten` per user/API key at the gateway; redirects are limited per IP only to blunt abuse.
+
+---
+
+## 6. High-Level Architecture
+
+```
+                     ┌──────────────────────┐
+                     │  User / Client       │
+                     │  (Web, Mobile, API)  │
+                     └──────────┬───────────┘
+                                │
+                     ┌──────────▼───────────┐
+                     │  CDN (edge cache)    │
+                     │  hot 301/302 hits    │
+                     └──────────┬───────────┘
+                                │ miss / API calls
+                     ┌──────────▼───────────┐
+                     │ API Gateway / LB     │
+                     │ TLS, auth, rate limit│
+                     │ (routing only)       │
+                     └───┬──────┬───────┬───┘
+         POST /shorten   │      │       │  GET /stats/{id}
+         PUT/DELETE /urls│      │       │
+         (100K/day)      │      │ GET /{short_code}
+                         │      │ (100M/day)
+        ┌────────────────▼┐  ┌──▼───────────────┐  ┌──────────────────┐
+        │ Write Service   │  │ Read Service     │  │ Analytics Service│
+        └────────┬────────┘  └────────┬─────────┘  └────────┬─────────┘
+                 │                    │                     │
+   ┌─────────────▼────────────────────▼─────────────────────▼───────────┐
+   │ Data & Messaging Tier (accessed only by the services above)        │
+   │                                                                    │
+   │  ┌───────────────┐  ┌───────────────┐  ┌───────────────────────┐   │
+   │  │ ID Generator  │  │ Redis Cache   │  │ Primary Data Store    │   │
+   │  │ ZK-backed     │  │ hot URLs      │  │ MySQL / PostgreSQL    │   │
+   │  │ ranges        │  │ ~250MB, 24h   │  │ urls, custom_aliases, │   │
+   │  │ → short_code  │  │               │  │ url_audit_log         │   │
+   │  └───────────────┘  └───────────────┘  │ sharded by short_code │   │
+   │                                        └──────────┬────────────┘   │
+   │  ┌───────────────┐                     async repl. │                │
+   │  │ Kafka         │                     ┌──────────▼────────────┐   │
+   │  │ click events  │                     │ Regional Read Replicas│   │
+   │  └───────┬───────┘                     │ (APAC, EU, AMER)      │   │
+   │          │                             └───────────────────────┘   │
+   │  ┌───────▼───────┐  ┌───────────────────────┐                      │
+   │  │ Analytics     │─►│ ClickHouse / BigQuery │                      │
+   │  │ Pipeline      │  │ (click store)         │                      │
+   │  │ (Spark/Flink) │  └───────────────────────┘                      │
+   │  └───────────────┘                                                 │
+   └────────────────────────────────────────────────────────────────────┘
+```
+
+**Flows**
+- **Redirect (core path):** `GET /{short_code}` → Gateway → Read Service → check Redis. **Hit:** return the long URL immediately. **Miss:** read the database (nearest read replica), store the mapping in Redis for later requests, then return the redirect. A click event is published to Kafka asynchronously.
+- **Shorten:** Gateway → Write Service → ID Generator (get `short_code`) → Primary DB (insert) → return. *Optional:* also write to Redis (eager warming) for predicted hot links; see Cache Warming.
+- **Edit/Disable:** Gateway → Write Service → Primary DB (update) → Redis (invalidate).
+- **Stats:** Gateway → Analytics Service → ClickHouse / BigQuery.
 
 **Kafka** decouples writes from analytics processing. Analytics can lag without impacting the critical path.
 
 ---
 
-## 5. Component 1: Unique ID Generation
+## 7. Component 1: Unique ID Generation
 
 The core challenge: generate 6–7 character codes that are:
 - **Globally unique** (no collisions across all instances)
@@ -217,18 +314,39 @@ Algorithm:
   1. Generate a candidate short code via:
      a) Random base-62 string (6 chars)  OR
      b) Hash(user_id + timestamp + random_salt) → base-62
+     (Note: base-62 = a number system with 62 symbols: a-z, A-Z, 0-9.
+      URL-safe and compact; 6 chars → 62^6 ≈ 56.8B possible codes.)
   2. Check if code exists in database (via lookup or cache)
   3. If exists → retry with different candidate (exponential backoff)
   4. If doesn't exist → insert and return
 
 Collision resolution:
   Random retry:  O(1) expected tries if collision rate is low
-  Hashable:      Deterministic; can embed metadata (user intent)
+  Hash-based:    Deterministic; same inputs → same code (dedup possible); on collision, change the salt and re-hash
   
 Downsides:
   • Requires database lookup before insertion (critical path overhead)
   • Race condition: two threads may generate same code simultaneously
   • Retry storms possible under high write concurrency
+
+Retry policy:
+  Max retries:  3-5 (cap at 5)
+    • 6-char base-62 → ~56.8B codes; at 1B stored URLs, p(collision) ≈ 1.8% per try
+    • All 3 tries fail ≈ 6 in a million; all 5 tries fail ≈ 2 in a billion
+    • Hitting the cap signals a real problem (keyspace nearly full, DB issue), so fail instead of looping
+  Backoff:      Not needed for pure collisions (each random candidate is independent → retry immediately)
+    • Use small backoff + jitter only for contention/transient errors: 10ms, 20ms, 40ms (+ jitter)
+  Timeouts:
+    • Single DB/cache existence check: 20-50 ms
+    • Whole write path (all retries):  200-500 ms budget
+    • Client-facing request timeout:   1-2 s
+  On budget/cap exceeded:
+    • Return 503 Service Unavailable with Retry-After (not 409; the conflict is internal)
+    • Log + alert; frequent retries >2 → increase code length (6 → 7 chars) or switch to counter approach
+    • Idempotency-Key lets the client safely retry the whole request without duplicates
+
+Better option: skip check-then-insert; just INSERT with a UNIQUE constraint and
+retry only on constraint violation (removes the race condition and saves a round trip)
 ```
 
 ### Approach 3: Counter-Based with Base Conversion (Staff-level insight)
@@ -257,6 +375,16 @@ Downsides:
   • Predictable codes (user can guess next codes)
   • Reveals usage volume (id growth rate)
 ```
+
+**60-second talk track:**
+
+> "The third approach avoids collisions by construction instead of detecting them. I keep a single global counter, and every time a user shortens a URL I atomically increment it, so each request gets a unique integer. I then convert that integer to base-62, using a-z, A-Z and 0-9, which turns a number like one billion into a compact 6-character code. Because every integer is unique, every code is unique, so there's no database lookup before insert, no retries, and no race conditions. Generation is O(1), and 6 base-62 characters give us about 56 billion codes, which is plenty for our scale.
+>
+> The trade-offs are two things:
+> - The counter is a single point of contention and failure, so in production I'd not hit it per request. Instead, each app server leases a batch, say a million IDs, from ZooKeeper or a database sequence and hands them out locally.
+> - The codes are sequential, so users can guess the next one and infer our traffic volume. To fix that, I'd shuffle each batch locally, or use a bijective scramble of the integer before encoding.
+>
+> That's my recommended hybrid: counter-based uniqueness with non-guessable codes."
 
 ### Staff-Level Decision Matrix
 
@@ -296,6 +424,19 @@ Benefits:
   • Graceful under write storms (just allocate new ranges)
 ```
 
+**60-90 second talk track:**
+
+> "My recommended design is a hybrid: a counter for uniqueness plus a shuffle for unpredictability. A pure counter gives zero collisions and O(1) generation, but its codes are sequential, so anyone can guess the next one and estimate our traffic. A pure random or hash approach hides the pattern but needs a database check and retries.
+>
+> The hybrid takes the best of both. A central, durable counter, such as a Postgres sequence or ZooKeeper, doesn't hand out single IDs. It leases ranges. Each app server asks for a block, say one million IDs from one billion to one billion plus a million. The server converts that block to base-62 codes and shuffles them in memory. After that, creating a short URL is just popping the next code off the shuffled list. There's no database lookup, no collision check and no network call on the hot path.
+>
+> Uniqueness is guaranteed because ranges never overlap and base conversion is one-to-one. Codes look random because of the shuffle. When a server runs out, it fetches a new range, so even a write storm only adds a few cheap calls to the counter.
+>
+> The trade-offs:
+> - If a server crashes, its unused IDs are lost, which is fine with a 56-billion keyspace.
+> - The counter itself must be durable. ZooKeeper or the database sequence has to persist its value, with writes synced to disk and replicated, so that after a full cluster restart it resumes from where it left off instead of from zero. If it reset, it would reissue ranges that were already handed out and cause collisions with previously issued codes.
+> - Custom aliases can still collide, so I enforce a UNIQUE constraint on the write path and keep the alias namespace separate from generated codes."
+
 ### Collision Handling at Write Time (Critical)
 
 Even with a collision-free ID generator, **custom aliases** may collide:
@@ -323,7 +464,7 @@ Fix: Rely on database UNIQUE constraint; catch duplicate key exception
 
 ---
 
-## 6. Component 2: Write Path (Shorten)
+## 8. Component 2: Write Path (Shorten)
 
 ### Request Processing Pipeline
 
@@ -364,10 +505,11 @@ POST /shorten
 └──────────────────┬──────────────────────┘
                    │
 ┌──────────────────▼──────────────────────┐
-│ Step 5: Cache & Return                  │
+│ Step 5: Return (optional: warm cache)   │
+│ Optional eager warming, hot links only: │
 │ SET Redis short_code → {                │
 │   long_url, created_at, user_id,        │
-│   ttl: 24h                              │
+│   ttl: min(24h, expire_at - now) ± jitter│
 │ }                                       │
 │ Return { short_code, short_url }        │
 └──────────────────────────────────────────┘
@@ -421,7 +563,7 @@ For P99 < 500ms:
 
 ---
 
-## 7. Component 3: Custom URL Aliases
+## 9. Component 3: Custom URL Aliases
 
 Vanity codes like `bit.ly/obama` are valuable but introduce complexity.
 
@@ -512,7 +654,7 @@ Implementation:
 
 ---
 
-## 8. Component 4: Read Path (Redirect)
+## 10. Component 4: Read Path (Redirect)
 
 The read path is the critical section: 100M+ redirects/day, P99 < 100ms.
 
@@ -565,7 +707,8 @@ GET /{short_code}
         │ Step 5: Update Cache Locally    │
         │ SET Redis:                      │
         │   {short_code} → {long_url}     │
-        │   TTL: 24 hours                 │
+        │   TTL: min(24h, expire_at-now)  │
+        │        ± 5-10% jitter           │
         │ (Lazy population; warm cache    │
         │  for future requests)           │
         └────────────────────────────────┘
@@ -606,10 +749,12 @@ Expected: < 1ms on cached page, ~5-10ms on disk hit
 
 ### Cache-Aside (Lazy Loading)
 
+This is the main reason redirects are fast: `GET /{short_code}` checks Redis; a hit returns the long URL immediately, and a miss reads the database and stores the mapping in Redis for later requests.
+
 On first request to a URL:
 1. Cache miss
 2. Fetch from database
-3. Populate cache (TTL: 24h)
+3. Populate cache (TTL: `min(24h, expire_at - now)` ± 5-10% jitter; links with no expiry use 24h; if `ttl <= 0`, don't cache and return 410 Gone)
 4. Serve redirect
 
 Subsequent requests hit Redis (sub-ms).
@@ -617,7 +762,11 @@ Subsequent requests hit Redis (sub-ms).
 **Problem:** If a URL is edited (long_url changed), cache becomes stale.
 
 **Solution:**
-- Short TTL (24h) accepts some staleness
+- Short TTL (capped at 24h) accepts some staleness
+- Cap TTL at the link's remaining lifetime (`min(24h, expire_at - now)`) so an expired link is never served from cache
+- Add ±5-10% jitter to TTLs to avoid a cache stampede when many keys expire together
+- Negative caching: cache 404/410 results for 30-60 s to protect the DB from repeated lookups
+- Keep an `if now >= expire_at → 410` check at redirect time as a safety net (clock skew)
 - Manual invalidation: on /edit endpoint, delete from cache immediately
 - Stale-while-revalidate: return cached data while refreshing in background
 
@@ -644,13 +793,14 @@ Redirect status codes:
   • Browser caches redirect locally
   • Second request goes directly to long_url (skips us)
   • Pro: Load reduction; user experience (faster)
-  Con: Can't track analytics on every redirect
+  Con: Can't change/expire target for clients that already cached it
+       (cached repeat visits also won't reach the redirect service; see analytics note below)
   
 302 (Found, Temporary Redirect):
-  • Browser doesn't cache
-  • Every request comes to us (trackable)
-  • Pro: Full analytics; can change target
-  Con: Higher load on us; slower for user
+  • Browser doesn't cache by default
+  • Every request reaches the redirect layer (CDN or our service)
+  • Pro: Can change/expire target immediately
+  Con: Higher load on us; slightly slower for user
   
 307 (Temporary Redirect, HTTP/1.1):
   • Like 302 but preserves request method
@@ -659,7 +809,11 @@ Redirect status codes:
 Recommendation:
   • Default: 301 (most users expect permanent)
   • Configurable: allow user to choose 301 vs 302
-  • Analytics: track via server-side Kafka event, not HTTP redirects
+  • Pick 301 vs 302 by whether the destination is truly permanent, not by analytics needs
+  • Analytics is a separate decision: collect events from the layer serving the redirect
+    - Browser-cached 301s never reach the CDN or our service (only the first visit per browser is observable)
+    - CDN-cached redirects may not reach our service, but CDN access logs / edge events can still emit click events
+    - Redirect service: publish a server-side Kafka click event (not tied to the HTTP status code)
 ```
 
 ### Client-Side Caching
@@ -672,9 +826,44 @@ Browsers cache 301 redirects aggressively, potentially ignoring your cache heade
 
 **Mitigation:** Set a reasonable expires_at TTL in the database; after expiry, return 410 Gone.
 
+### Choosing 301 vs 302 (and What the CDN May Cache)
+
+Decide per link with two questions: can the destination change or expire, and do we need to see every request? The status code signals the first; what the CDN actually obeys is the `Cache-Control` header, so set both deliberately.
+
+| Link type | Status | CDN cache (`s-maxage`) | Browser cache (`max-age`) |
+|---|---|---|---|
+| Truly permanent, never edited/expired | 301 | Long (e.g. days) | Long |
+| May be edited, expires, or can be disabled | 302 | Short, capped at `min(cap, expire_at - now)`; purge on `PUT`/`DELETE` | Off or very short |
+| Dynamic logic (geo/device targeting, A/B routing, per-request rate limits) | 302 | Don't cache at CDN; go to the service | Off |
+| 404 / 410 (missing, expired, disabled) | 404 / 410 | Don't cache, or only briefly (30-60 s) | Off |
+
+**Rules of thumb:**
+- Permanent and stable → long CDN caching; most requests never reach the service.
+- Changeable or expiring → short TTL plus explicit CDN purge on edit/delete.
+- Dynamic or about to expire → serve from the service.
+- Analytics is a separate decision: if the CDN serves the redirect, collect click events from CDN access logs/edge events, plus the service's Kafka event for requests that reach origin. Don't use the status code as the analytics switch.
+
+**60-90 second talk track:**
+
+> "I decide this per link with two questions: can the destination ever change or expire, and do I need to see every request? The status code expresses the first, but what the CDN actually obeys is the Cache-Control header, so I set both deliberately.
+>
+> A 301 means the owner told us the destination is truly permanent. Those are safe to cache at the CDN, and in browsers, for a long time, with a long max-age and s-maxage. Most requests never reach my service, which gives the biggest load reduction. I wouldn't use a 301 for anything with an expiry, a possible edit, or a disable flag.
+>
+> A 302 means the destination may change or expire. I can still let the CDN cache it, but with a short s-maxage capped at the remaining lifetime, min(cap, expire_at - now), and browser caching off or very short. Then edits and deletes take effect quickly, and I also purge the CDN key on PUT or DELETE.
+>
+> Some responses I don't cache at the CDN:
+> - 404s, or only briefly, so a newly created code doesn't look missing.
+> - 410s for expired or disabled links, or only briefly.
+> - Links with per-request logic, like geo or device targeting, A/B routing or rate limiting.
+> - Links that are about to expire.
+>
+> Analytics is a separate decision. If the CDN serves the redirect, my service won't see it, so I collect click events from the CDN's access logs or edge events, plus my own Kafka event for requests that reach origin. I don't use the status code as the analytics switch.
+>
+> So the rule is: permanent and stable means long CDN caching, changeable or expiring means short TTL plus purge on change, and anything dynamic goes to my service."
+
 ---
 
-## 9. Component 5: Caching Layer
+## 11. Component 5: Caching Layer
 
 ### Cache Topology
 
@@ -699,20 +888,21 @@ Tier 3: Database (primary + replicas)
 
 ### Cache Warming
 
-When a URL is shortened, should we warm the cache immediately?
+Redirects are fast because of cache-aside (Option B below), not because of warming. Eager warming is an optional optimization on top of it.
 
-**Option A: Eager warming**
+**Option A: Eager warming (optional)**
+Happens at creation time: after saving the new short code to Postgres, also write it to Redis before anyone has requested it.
 ```
 On POST /shorten:
   1. Insert database
   2. SET Redis short_code → long_url (immediate)
   3. Return response
 
-Benefit: Cache always warm for new URLs
-Cost: Extra Redis operation (not critical path)
+Benefit: Avoids the first cache miss for that link
+Cost: Extra Redis operation (not critical path); uses cache space for links that may never be opened
 ```
 
-**Option B: Lazy loading (cache-aside)**
+**Option B: Lazy loading (cache-aside, the default)**
 ```
 On GET /{short_code}:
   1. Check Redis (miss)
@@ -724,7 +914,7 @@ Benefit: No extra work for URLs never accessed
 Cost: First user sees longer latency (5-10ms vs <1ms)
 ```
 
-**Recommendation:** Option A is better for short-term high-profile links. Option B is fine for the long tail. Use Option A if you can afford the Redis write.
+**Recommendation:** Use Option B (cache-aside) as the default for all links. Treat Option A as an optional optimization for predicted hot links (for example a campaign or launch link), not for every new URL.
 
 ### Cache Invalidation
 
@@ -734,7 +924,7 @@ Cost: First user sees longer latency (5-10ms vs <1ms)
 
 | Event | Action |
 |---|---|
-| URL shortened | Warm cache (Option A) |
+| URL shortened | No cache action by default (populated on first read); optionally warm if predicted hot (Option A) |
 | URL edited | Invalidate Redis; DB update |
 | URL deleted/disabled | Invalidate Redis; mark active=FALSE in DB |
 | URL expires | DB query checks expires_at; no special cache action needed (lazy eviction) |
@@ -759,7 +949,7 @@ Mitigation:
 
 ---
 
-## 10. Component 6: Analytics & Tracking
+## 12. Component 6: Analytics & Tracking
 
 ### Click Tracking at Scale
 
@@ -875,7 +1065,7 @@ Mitigation:
 
 ---
 
-## 11. Component 7: Storage Layer
+## 13. Component 7: Storage Layer
 
 ### Multi-Tier Storage Design
 
@@ -900,6 +1090,7 @@ CREATE TABLE urls (
   expires_at TIMESTAMP NULLABLE,
   active BOOLEAN DEFAULT TRUE,
   deleted_at TIMESTAMP NULLABLE,
+  version INT NOT NULL DEFAULT 1,        -- CAS counter; bumped on every edit
   
   -- Metadata
   title VARCHAR(500),                    -- User-provided title
@@ -993,7 +1184,7 @@ Acceptable: Analytics data is eventually consistent anyway.
 
 ---
 
-## 12. CAP Theorem Positioning
+## 14. CAP Theorem Positioning
 
 At Staff level, explicitly address CAP for each component:
 
@@ -1013,7 +1204,7 @@ At Staff level, explicitly address CAP for each component:
 
 ---
 
-## 13. Failure Modes & Mitigations
+## 15. Failure Modes & Mitigations
 
 | Failure | Symptom | Detection | Mitigation |
 |---|---|---|---|
@@ -1031,7 +1222,7 @@ At Staff level, explicitly address CAP for each component:
 
 ---
 
-## 14. Concurrency & Collision Handling
+## 16. Concurrency & Collision Handling
 
 ### Race Condition: Simultaneous Custom Code Requests
 
@@ -1126,7 +1317,7 @@ For 56B URLs: P ≈ 100% (guaranteed collision)
 
 ---
 
-## 15. Global Distribution & Geo-Routing
+## 17. Global Distribution & Geo-Routing
 
 ### Multi-Region Deployment
 
@@ -1196,7 +1387,7 @@ Mitigation:
 
 ---
 
-## 16. Senior vs Staff Answer Differentiators
+## 18. Senior vs Staff Answer Differentiators
 
 ### Senior-level expectations
 
@@ -1231,7 +1422,7 @@ Mitigation:
 
 ---
 
-## 17. Interview Time Allocation
+## 19. Interview Time Allocation
 
 For a 45-minute system design session:
 
@@ -1252,7 +1443,7 @@ For a 45-minute system design session:
 
 ---
 
-## 18. Quick-Reference Cheatsheet
+## 20. Quick-Reference Cheatsheet
 
 ```
 KEY NUMBERS
@@ -1276,7 +1467,7 @@ ARCHITECTURE DECISIONS
 Write path:    Shorten API → DB write → Redis populate (eager)
 Read path:     GET → Redis check → DB fallback → 301 redirect → Kafka click event
 Analytics:     Async via Kafka (fire-and-forget; decouple from critical path)
-Caching:       Cache-aside with 24h TTL; stale-while-revalidate on expiry
+Caching:       Cache-aside with TTL = min(24h, expire_at - now) + jitter; stale-while-revalidate on expiry
 Replication:   Async multi-region replicas; CP for primary, AP for replicas
 
 ID GENERATION STRATEGIES
@@ -1320,6 +1511,125 @@ STAFF-LEVEL SIGNALS TO HIT
 ✓ Custom alias namespace management (reserved words, expiry)
 ✓ Proactive failure mode enumeration
 ```
+
+---
+
+## 21. Scaling Reads to 10K Redirects/Second
+
+**Question:** *How can your system scale to support 10K redirects (reads) per second?*
+
+10K/s is about 9× the 1,150/s average in the capacity estimate (and close to the 11.5K/s peak). The write path (~1/s) is irrelevant here; this is purely a read-scaling problem. The workload is ideal for scaling: **read-only, key-value lookups, a tiny hot set (~250 MB), and tolerant of slight staleness.**
+
+### The answer in one line
+
+**Three layers, each absorbing traffic so the next sees far less:** the **CDN** absorbs edge traffic, **Redis** handles CDN misses, and **stateless Read Services scale horizontally behind a load balancer**. The database only sees Redis misses.
+
+```
+ 10,000 req/s
+      │
+ ┌────▼─────┐  ~60% hit       ┌────────────────────────────────────────┐
+ │   CDN    ├────────────────►│ served at edge (never reaches origin)  │
+ └────┬─────┘                 └────────────────────────────────────────┘
+      │ ~4,000 req/s
+ ┌────▼───────────────────┐
+ │ Load balancer (multi-AZ)│
+ └────┬───────────────────┘
+      │
+ ┌────▼───────────────────────────────┐
+ │ Read Service × 8–10 (stateless,    │──► Kafka (async, batched click events)
+ │ autoscaled)                        │
+ └────┬───────────────────────────────┘
+      │ ~4,000 lookups/s
+ ┌────▼──────────────────────────────┐
+ │ Redis (cluster + replicas), 95%+ hit│
+ └────┬──────────────────────────────┘
+      │ ~200 reads/s (misses only)
+ ┌────▼──────────────────────────────┐
+ │ DB read replicas (shard if needed) │
+ └────────────────────────────────────┘
+```
+
+Even in the worst case with **no CDN**, Redis sees 10K ops/s (one node handles ~100K) and the DB sees 5% = 500 reads/s, which a single replica handles.
+
+### Core design: the three layers
+
+#### 1. CDN: absorbs edge traffic
+
+- Cache redirect responses at the edge (see [Choosing 301 vs 302](#choosing-301-vs-302-and-what-the-cdn-may-cache)). Permanent links get a long `s-maxage`; editable/expiring links get a short, capped `s-maxage` plus a purge on `PUT`/`DELETE`.
+- A viral link at 100K clicks/s is still one cached object at the edge. Origin shield / request collapsing means 1,000 simultaneous requests for an uncached link become one origin request.
+- Dynamic links (geo/device targeting, A/B) and 404/410s are not cached for long, so they still reach the service.
+
+#### 2. Redis: handles CDN misses
+
+- Cache-aside: the Read Service checks Redis, reads the DB on a miss, then populates Redis with TTL = `min(24h, expire_at - now)` ± jitter (see [Cache-Aside](#cache-aside-lazy-loading)).
+- The hot set is ~250 MB, so the working set fits in memory on every node. The constraint is ops/s and availability, not capacity.
+- One node does ~100K ops/s, so 4K–10K/s fits easily; use **Redis Cluster** (shard by `short_code`, replicas per shard) for headroom and failover, and read from replicas.
+- On edit/delete: update the DB, then invalidate Redis (and purge the CDN key).
+- Result: 95%+ hit rate, so the database sees ~200 reads/s. These are primary-key point reads (~1 ms in memory, 5–10 ms from disk) on regional read replicas; if data or miss traffic outgrows one primary, shard by `hash(short_code)` (see [Partitioning](#partitioning-strategy-for-sharding)).
+
+#### 3. Stateless Read Services: scale horizontally behind a load balancer
+
+- The service holds no state, so scaling is "add instances": round-robin / least-connections, no sticky sessions.
+- A redirect is I/O-bound (one cache lookup + a tiny response), so one instance realistically does ~2K–5K req/s.
+
+```
+Sizing:
+  4,000 req/s reaching origin ÷ ~3,000 req/s per instance ≈ 2 instances
+  Plan for the no-CDN worst case (10,000 ÷ 3,000 ≈ 4), 2× spikes and N+1 failure → 8–10 instances
+  Autoscale on CPU / req-per-instance / p99 latency (e.g. target 50% CPU)
+```
+
+- **The ~3K req/s per instance is an assumption, not a benchmark; validate it with a load test.** A redirect is mostly waiting on I/O (one Redis lookup, ~5 ms end to end), so by Little's Law 3K req/s needs only ~15 requests in flight, which is easy for an async server. 3K is deliberately conservative to leave room for TLS, logging, metrics and GC pauses. Thread-per-request stacks (e.g. classic Tomcat) may only reach 500–1.5K req/s, so re-size with `instances = peak req/s ÷ measured per-instance capacity, plus headroom`.
+- Non-blocking I/O and keep-alive/HTTP/2 between LB and service; deploy across multiple AZs so losing one keeps capacity.
+
+#### Supporting choices (keep the core path fast)
+
+- **Analytics is async:** publish a click event to Kafka and return. 10K events/s is small for Kafka; batch sends (`linger.ms` 5–20 ms, compression) and use a bounded buffer so a Kafka outage drops events rather than failing redirects. No counters, joins or writes in the redirect request.
+- **Regional deployment:** Read Service + Redis + DB replica per region with GeoDNS/anycast. This divides the 10K/s across regions and cuts latency; writes still go to one primary region (see [Global Distribution](#17-global-distribution--geo-routing)).
+
+### Optional hardening (for unusual cases, not the foundation)
+
+The design above already handles 10K/s. These add protection against specific edge cases; mention them **after** the core path.
+
+| Technique | Problem it addresses | How it helps |
+|---|---|---|
+| **Single-flight / request coalescing** | A hot key expires in Redis and 100 concurrent requests all miss | One DB read per key per instance; the other 99 wait for the result instead of causing 99 more reads |
+| **TTL jitter / stale-while-revalidate** | Many keys expiring together | Spreads refreshes; serves stale data while refreshing |
+| **Bloom filter of valid codes** | Bots request random non-existent codes, which always miss and reach the DB | Rejects likely-nonexistent codes before the DB (no false negatives; rare false positives pass through to the DB) |
+| **Negative caching (30–60 s)** | Repeated lookups of the same missing/expired code | Caches the 404/410 so the DB isn't re-queried |
+| **In-process (L1) cache, 5–60 s TTL** | One viral link concentrates traffic on a single Redis shard | Serves the hottest keys from memory, removing the network hop and shard hot spot |
+| **Cache warming** | Cold Redis node (restart/flush) means 0% hit rate | Preload top-N hot keys; roll restarts gradually |
+| **Load shedding / DB concurrency cap** | Redis outage sends everything to the DB | Cap concurrent DB queries; serve stale or return 503 rather than queueing |
+
+### Beyond 10K
+
+| Target | What changes |
+|---|---|
+| 10K → 100K req/s | Add Read Service instances and Redis shards; raise CDN TTLs for permanent links. Architecture is unchanged. |
+| 100K → 1M req/s | Multi-region active-active reads; more Redis shards; the CDN does most of the work; shard the DB; consider edge KV/workers. |
+| One viral link (1M req/s on one code) | CDN absorbs it (one cached object); if Redis is hit, replicate the hot key across shards (`key#1..key#N`) or add an L1 cache. |
+
+### Validate and monitor
+
+- **Load test** to 2× target (20K req/s) using a realistic Zipf (power-law) key distribution plus some misses/404s; uniform keys make the cache look better than it is.
+- **Watch:** hit rate per layer (CDN, Redis), p50/p99 latency, DB QPS and connections, Redis ops/s and hot keys, Kafka producer errors.
+- **Alert** when Redis hit rate drops below ~90%, DB QPS spikes, or p99 exceeds 100 ms.
+
+### 60–90 second talk track
+
+> "10K redirects a second is about 9× our average, but it's a friendly workload: read-only, key-value, with a tiny hot set of about 250 MB. So I scale by absorbing traffic in three layers, so the database never sees 10K.
+>
+> First, the CDN caches redirects at the edge. Permanent links get long TTLs, editable ones get short TTLs with a purge on change, so viral spikes and repeat clicks mostly never reach origin. Say 60% hit, so about 4K a second gets through.
+>
+> Second, the Read Service is stateless, so I scale it horizontally behind a load balancer across availability zones. At roughly 3K requests a second per instance, a handful of instances covers it, and I'd run 8 to 10 for spikes and failure, autoscaling on CPU and latency.
+>
+> Third, Redis handles what the CDN misses. One node does about 100K ops a second, so this fits easily, and I'd run a cluster with replicas for availability. With a 95%-plus hit rate, the database sees only a couple of hundred point reads a second, which a couple of read replicas handle. If data grows, I shard by hash of short code.
+>
+> Click tracking is asynchronous through Kafka so it never touches the redirect path, and I'd deploy regionally with geo routing to split load and cut latency.
+>
+> On top of that I'd add hardening for edge cases: single-flight so an expired hot key causes one DB read instead of a hundred, a Bloom filter and negative caching so bots probing random codes can't punch through to the database, and a small local cache if one viral link concentrates on a single Redis shard.
+>
+> To validate, I'd load test at 2× with a Zipf key distribution and watch hit rate per layer, p99 and DB QPS. Going to 100K is the same architecture with more instances and shards."
 
 ---
 
