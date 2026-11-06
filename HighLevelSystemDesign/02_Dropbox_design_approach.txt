@@ -1,0 +1,17 @@
+1.Functional Requirement
+2.Non-Functional Requirement
+3.Core Entities
+4.APIs
+5.High Level Design
+	1. Users should be able to upload a file from any device
+	2. Users should be able to download a file from any device
+	3. Users should be able to share a file with other users
+	4) Users can automatically sync files across devices
+		Local -> Remote
+		Remote -> Local
+6.Potential Deep Dives
+	1. How can you support large files?
+	2. But how should we ensure this chunks field is kept in sync with the actual chunks that have been uploaded?
+	3. How can we make uploads, downloads, and syncing as fast as possible?
+	4. How can you ensure file security?
+	Encryption in Transit, Encryption at Rest,Access Control

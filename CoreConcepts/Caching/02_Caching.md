@@ -10,6 +10,7 @@
 2. [Where to Cache: Layers in Your System](#2-where-to-cache-layers-in-your-system)
    - [2.1 External Caching](#21-external-caching)
    - [2.2 In-Process Caching](#22-in-process-caching)
+     - [Hot-Key Promotion/Demotion: How Keys Move Between L1 (In-Process) and L2 (External)](#hot-key-promotiondemotion-how-keys-move-between-l1-in-process-and-l2-external)
    - [2.3 CDN (Content Delivery Network)](#23-cdn-content-delivery-network)
    - [2.4 Client-Side Caching](#24-client-side-caching)
 3. [Cache Architectures (Read/Write Patterns)](#3-cache-architectures-readwrite-patterns)
@@ -73,6 +74,30 @@ There are four primary layers where caching can live, each with distinct trade-o
 - **Trade-off:** Each server has its own isolated memory — no sharing across instances. This causes potential inconsistency between servers and wasted/duplicated memory.
 - **When to use:** Rarely the default in interviews. Reach for it only for low-level optimizations, ultra-low-latency requirements, or small, mostly-static data like config values or lookup tables used on every request.
 - **Default recommendation:** External caching remains the default; in-process caching is a secondary optimization.
+
+**Examples from this repo's system designs** (same pattern — a short-TTL, per-node, in-memory layer sitting *in front of* a shared/external cache or service, not replacing it):
+
+- **URL Shortener — L1 hot-key cache** ([`01_url_shortener_system_design.md`](../../HighLevelSystemDesign/01_url_shortener_system_design.md#11-component-5-caching-layer)): a 5–60s TTL in-process cache sits in front of Redis specifically to absorb the case where one viral link concentrates traffic onto a single Redis shard — removing both the network hop and the hot-shard risk for just the handful of keys that need it, while everything else still goes through the shared Redis layer.
+- **Web Crawler — per-fetcher DNS cache** ([`03_WebCrawler.md`](../../HighLevelSystemDesign/03_WebCrawler.md#12-component-8-dns-cache)): each fetcher node keeps its own local DNS cache instead of calling a shared DNS-cache service, trading perfect consistency (a stale entry is possible) for avoiding a network round trip on every single fetch — acceptable because a stale DNS entry just causes a stall, not incorrect data.
+- **Key Vault — SDK/gateway-side policy cache** ([`19_Key_vault_system_design.md`](../../HighLevelSystemDesign/19_Key_vault_system_design.md)): access policies are cached in-process in the calling SDK/gateway for fast-path authorization checks, but with a single-digit-second TTL rather than the usual minutes — a deliberate narrowing of the staleness window because the downside (a revoked identity still being allowed in) is a security incident, not just a stale read.
+- **Metrics/Monitoring Platform — query-engine result cache** ([`16_metrics_monitoring_platform_system_design.md`](../../HighLevelSystemDesign/16_metrics_monitoring_platform_system_design.md)): each query-engine node caches recent query results locally, keyed by `(query, time range, resolution)`, since dashboards disproportionately re-run the same handful of default queries — a cheap, local win that absorbs most read traffic before it ever reaches the expensive fan-out-and-aggregate path.
+
+#### Hot-key promotion/demotion: how keys move between L1 (in-process) and L2 (external)
+
+Since which keys are "hot" shifts over time, it's tempting to picture an explicit migration step moving a key from Redis into the local cache and back. In practice there isn't one — the external cache (Redis) stays the full, authoritative dataset at all times, and the in-process layer is just a transient overlay that happens to reflect whichever keys are currently hot. It self-adjusts without any explicit classifier:
+
+- **Promotion (cold → hot) falls out of the access pattern, not a decision.** Every read uses the same cache-aside path: check the local map → miss → fetch from Redis → write into the local map with a short TTL (5–60s) → return. A genuinely hot key gets re-requested before its TTL expires, so it keeps getting refreshed locally and effectively stays "promoted" for as long as traffic keeps hitting it.
+- **Demotion (hot → cold) is just TTL expiry or LRU eviction** — nothing has to detect that a key cooled off. Bound the local map with an LRU cap in addition to the TTL: if many keys are hot simultaneously and only some fit the memory budget, LRU naturally evicts the coldest of the hot set. A key that stops being requested simply expires after one TTL window and reverts to pure Redis reads.
+- **No cross-instance coordination is needed for the promotion decision itself** — if the load balancer spreads traffic roughly evenly, every instance independently notices the same key is hot from its own slice of requests and caches it on its own; there's no shared "hot key registry" to keep in sync.
+
+**Tunable knobs:**
+
+| Knob | Effect |
+|---|---|
+| TTL length | Shorter bounds staleness tighter, but re-fetches sustained-hot keys more often (cheap — just a Redis call) |
+| LRU capacity | Caps worst-case per-instance memory regardless of how many keys go viral at once |
+| Single-flight on expiry | When a hot key's TTL lapses, coalesce simultaneous misses into one Redis fetch instead of a stampede |
+| Write-time invalidation (optional) | A pub/sub purge on write (e.g. WhatsApp's push-invalidated permission cache, [`08_Messaging_App_like_WhatsApp.md`](../../HighLevelSystemDesign/08_Messaging_App_like_WhatsApp.md)) when TTL-bound staleness isn't acceptable |
 
 ### 2.3 CDN (Content Delivery Network)
 
